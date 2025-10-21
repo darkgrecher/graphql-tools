@@ -44,12 +44,15 @@ import io.ballerina.stdlib.graphql.commons.utils.SdlSchemaStringGenerator;
 import io.ballerina.tools.diagnostics.DiagnosticSeverity;
 
 import java.io.PrintStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 
 import static io.ballerina.graphql.schema.Constants.EMPTY_STRING;
 import static io.ballerina.graphql.schema.Constants.PERIOD;
@@ -76,6 +79,12 @@ public class SdlSchemaGenerator {
      */
     public static void generate(Path filePath, Path outPath, String serviceBasePath, PrintStream outStream)
             throws SchemaFileGenerationException {
+        
+        // IMMEDIATE file conflict check - before ANY expensive processing
+        if (!checkFileConflictsForDefaultSchema(outPath, outStream)) {
+            return; // Exit immediately if user chooses not to overwrite
+        }
+        
         Project project = ProjectLoader.loadProject(filePath);
         PackageCompilation compilation = getPackageCompilation(project);
         Package packageName = project.currentPackage();
@@ -316,6 +325,86 @@ public class SdlSchemaGenerator {
         } else {
             return serviceName + PERIOD + duplicateCount;
         }
+    }
+
+    /**
+     * Get potential file names that would be generated, for early conflict checking.
+     */
+    private static List<String> getPotentialFileNames(SyntaxTree syntaxTree, SemanticModel semanticModel, 
+                                                      String serviceBasePath) throws SchemaFileGenerationException {
+        Map<String, String> servicesToGenerate = new HashMap<>();
+        List<String> availableServices = new ArrayList<>();
+        List<String> potentialFileNames = new ArrayList<>();
+
+        ModulePartNode modulePartNode = syntaxTree.rootNode();
+        extractSchemaStringsFromServices(serviceBasePath, modulePartNode, semanticModel, availableServices,
+                servicesToGenerate);
+        
+        // If there are no services found for a given service name.
+        if (serviceBasePath != null && servicesToGenerate.isEmpty()) {
+            throw new SchemaFileGenerationException(DiagnosticMessages.SDL_SCHEMA_101, null, serviceBasePath,
+                    availableServices.toString());
+        }
+        
+        // Generate potential file names
+        for (Map.Entry<String, String> schema : servicesToGenerate.entrySet()) {
+            String sdlFileName = getSdlFileName(syntaxTree.filePath(), schema.getKey());
+            potentialFileNames.add(sdlFileName);
+        }
+        return potentialFileNames;
+    }
+
+    /**
+     * Check for the default schema file conflict IMMEDIATELY - before any expensive processing.
+     * This provides instant feedback to users without wasting computation time.
+     * @return true if should proceed, false if should exit early
+     */
+    private static boolean checkFileConflictsForDefaultSchema(Path outPath, PrintStream outStream) {
+        // Check for the most common case - schema_graphql.graphql
+        Path defaultSchemaFile = outPath.resolve("schema_graphql.graphql");
+        if (Files.exists(defaultSchemaFile)) {
+            if (System.console() != null) {
+                // Improved formatting: Split into two lines for better readability
+                System.out.println("There is already a file named 'schema_graphql.graphql' in the target location.");
+                String userInput = System.console().readLine("Do you want to overwrite the file [Y/N] ? ");
+                if (!Objects.equals(userInput.toLowerCase(Locale.ENGLISH), "y")) {
+                    outStream.println("Schema generation cancelled by user.");
+                    return false; // Exit immediately - respect user's choice
+                }
+            } else {
+                // Non-interactive mode - default to not overwrite
+                outStream.println("File 'schema_graphql.graphql' already exists. Use interactive mode to overwrite.");
+                return false;
+            }
+        }
+        return true; // No conflict or user agreed to overwrite
+    }
+
+    /**
+     * Check for file conflicts and get user consent BEFORE doing any processing.
+     * @return true if should proceed, false if should exit early
+     */
+    private static boolean checkFileConflictsAndGetUserConsent(List<String> potentialFileNames, Path outPath, 
+                                                               PrintStream outStream) {
+        for (String fileName : potentialFileNames) {
+            Path potentialFilePath = outPath.resolve(fileName);
+            if (Files.exists(potentialFilePath)) {
+                if (System.console() != null) {
+                    // Improved formatting: Split into two lines for better readability
+                    System.out.println("There is already a file named '" + fileName + "' in the target location.");
+                    String userInput = System.console().readLine("Do you want to overwrite the file [Y/N] ? ");
+                    if (!Objects.equals(userInput.toLowerCase(Locale.ENGLISH), "y")) {
+                        outStream.println("Schema generation cancelled by user.");
+                        return false; // Exit early - respect user's choice
+                    }
+                } else {
+                    // Non-interactive mode - default to not overwrite
+                    outStream.println("File '" + fileName + "' already exists. Use interactive mode to overwrite.");
+                    return false;
+                }
+            }
+        }
+        return true; // No conflicts or user agreed to overwrite
     }
 
     /**
