@@ -53,6 +53,7 @@ import java.util.Map;
 
 import static io.ballerina.graphql.schema.Constants.EMPTY_STRING;
 import static io.ballerina.graphql.schema.Constants.PERIOD;
+import static io.ballerina.graphql.schema.utils.Utils.checkFileOverwriteConsent;
 import static io.ballerina.graphql.schema.utils.Utils.createOutputDirectory;
 import static io.ballerina.graphql.schema.utils.Utils.formatBasePath;
 import static io.ballerina.graphql.schema.utils.Utils.getDecodedSchema;
@@ -60,7 +61,6 @@ import static io.ballerina.graphql.schema.utils.Utils.getSchemaString;
 import static io.ballerina.graphql.schema.utils.Utils.getSdlFileName;
 import static io.ballerina.graphql.schema.utils.Utils.getServiceBasePath;
 import static io.ballerina.graphql.schema.utils.Utils.isGraphqlService;
-import static io.ballerina.graphql.schema.utils.Utils.resolveSchemaFileName;
 import static io.ballerina.graphql.schema.utils.Utils.writeFile;
 import static io.ballerina.stdlib.graphql.commons.utils.Utils.isGraphQLServiceObjectDeclaration;
 
@@ -93,22 +93,122 @@ public class SdlSchemaGenerator {
 
         SyntaxTree syntaxTree = doc.syntaxTree();
         SemanticModel semanticModel = compilation.getSemanticModel(docId.moduleId());
-        List<SdlSchema> schemaDefinitions = generateSdlSchema(syntaxTree, semanticModel, serviceBasePath);
-        List<String> fileNames = new ArrayList<>();
-        for (SdlSchema definition : schemaDefinitions) {
-            String fileName = resolveSchemaFileName(outPath, definition.getName());
-            createOutputDirectory(outPath);
-            writeFile(outPath.resolve(fileName), definition.getSchema());
-            fileNames.add(fileName);
-        }
-        if (fileNames.isEmpty()) {
+        
+        // Check file conflicts early before expensive schema generation
+        List<String> preliminaryFileNames = getPreliminaryFileNames(syntaxTree, semanticModel, serviceBasePath);
+        if (preliminaryFileNames.isEmpty()) {
             outStream.println("Given Ballerina file does not contain any GraphQL services");
             return;
         }
+        
+        // Check for file overwrite consent early
+        for (String fileName : preliminaryFileNames) {
+            checkFileOverwriteConsent(outPath, fileName);
+        }
+        
+        // Now proceed with the expensive schema generation only if user consented to file operations
+        List<SdlSchema> schemaDefinitions = generateSdlSchema(syntaxTree, semanticModel, serviceBasePath);
+        List<String> finalFileNames = new ArrayList<>();
+        for (int i = 0; i < schemaDefinitions.size(); i++) {
+            SdlSchema definition = schemaDefinitions.get(i);
+            String fileName = preliminaryFileNames.get(i);
+            createOutputDirectory(outPath);
+            writeFile(outPath.resolve(fileName), definition.getSchema());
+            finalFileNames.add(fileName);
+        }
+        
         outStream.println("SDL Schema(s) generated successfully and copied to :");
-        Iterator<String> iterator = fileNames.iterator();
+        Iterator<String> iterator = finalFileNames.iterator();
         while (iterator.hasNext()) {
             outStream.println("-- " + iterator.next());
+        }
+    }
+
+    /**
+     * Get preliminary file names for GraphQL services without generating the full schema.
+     * This is used for early file conflict detection.
+     * This method follows the same logic as extractSchemaStringsFromServices but without expensive operations.
+     */
+    private static List<String> getPreliminaryFileNames(SyntaxTree syntaxTree, SemanticModel semanticModel,
+                                                        String serviceBasePath) throws SchemaFileGenerationException {
+        Map<String, String> servicesToGenerate = new HashMap<>();
+        List<String> availableServices = new ArrayList<>();
+        
+        ModulePartNode modulePartNode = syntaxTree.rootNode();
+        extractServiceNamesOnly(serviceBasePath, modulePartNode, semanticModel, availableServices, servicesToGenerate);
+        
+        // If there are no services found for a given service name.
+        if (serviceBasePath != null && servicesToGenerate.isEmpty()) {
+            throw new SchemaFileGenerationException(DiagnosticMessages.SDL_SCHEMA_101, null, serviceBasePath,
+                    availableServices.toString());
+        }
+        
+        // Generate preliminary file names using the same logic as the actual generation
+        List<String> preliminaryFileNames = new ArrayList<>();
+        for (Map.Entry<String, String> entry : servicesToGenerate.entrySet()) {
+            String sdlFileName = getSdlFileName(syntaxTree.filePath(), entry.getKey());
+            preliminaryFileNames.add(sdlFileName);
+        }
+        return preliminaryFileNames;
+    }
+
+    /**
+     * Extract service names from the syntax tree without generating schemas.
+     * This mirrors extractSchemaStringsFromServices but without the expensive getSchemaString calls.
+     */
+    private static void extractServiceNamesOnly(String serviceBasePath, ModulePartNode modulePartNode,
+                                               SemanticModel semanticModel, List<String> availableServices,
+                                               Map<String, String> servicesToGenerate) {
+        int duplicateCount = 0;
+        for (Node node : modulePartNode.members()) {
+            SyntaxKind syntaxKind = node.kind();
+            if (syntaxKind == SyntaxKind.SERVICE_DECLARATION) {
+                ServiceDeclarationNode serviceNode = (ServiceDeclarationNode) node;
+                if (isGraphqlService(serviceNode, semanticModel)) {
+                    String actualBasePath = getServiceBasePath(serviceNode);
+                    String updatedServiceName = actualBasePath;
+                    if (servicesToGenerate.containsKey(actualBasePath)) {
+                        duplicateCount += 1;
+                        updatedServiceName = getUpdatedServiceName(actualBasePath, duplicateCount);
+                    }
+                    addToListNamesOnly(serviceBasePath, actualBasePath, updatedServiceName, availableServices,
+                            servicesToGenerate);
+                }
+            } else if (syntaxKind == SyntaxKind.MODULE_VAR_DECL && serviceBasePath == null) {
+                // if the service base path is given, the schema is not generated for the services with
+                // module level variable declarations since base path is unknown.
+                ModuleVariableDeclarationNode moduleVariableNode = (ModuleVariableDeclarationNode) node;
+                if (!isGraphQLServiceObjectDeclaration(moduleVariableNode)) {
+                    continue;
+                }
+                if (moduleVariableNode.initializer().isEmpty()) {
+                    continue;
+                }
+                ExpressionNode expressionNode = moduleVariableNode.initializer().get();
+                if (expressionNode.kind() == SyntaxKind.OBJECT_CONSTRUCTOR) {
+                    String service = EMPTY_STRING;
+                    if (servicesToGenerate.containsKey(service)) {
+                        duplicateCount += 1;
+                        service = getUpdatedServiceName(service, duplicateCount);
+                    }
+                    servicesToGenerate.put(service, "placeholder"); // Put placeholder, we only need the key
+                }
+            }
+        }
+    }
+
+    /**
+     * Add service name to map based on base path filter (names only version).
+     */
+    private static void addToListNamesOnly(String serviceBasePath, String actualPath, String updateServiceName,
+                                          List<String> availableServices, Map<String, String> servicesToGenerate) {
+        if (serviceBasePath != null) {
+            availableServices.add(actualPath);
+            if (formatBasePath(serviceBasePath).equals(actualPath)) {
+                servicesToGenerate.put(updateServiceName, "placeholder"); // Put placeholder, we only need the key
+            }
+        } else {
+            servicesToGenerate.put(updateServiceName, "placeholder"); // Put placeholder, we only need the key
         }
     }
 

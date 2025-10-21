@@ -242,6 +242,33 @@ public final class Utils {
     }
 
     /**
+     * This method use for checking the duplicate files early and asking for user consent.
+     * If user chooses not to overwrite, throws an exception to abort the process.
+     *
+     * @param outPath     output path for file generated
+     * @param schemaName  given file name
+     * @throws SchemaFileGenerationException if user chooses not to overwrite existing file
+     */
+    public static void checkFileOverwriteConsent(Path outPath, String schemaName) 
+            throws SchemaFileGenerationException {
+        if (outPath != null && Files.exists(outPath)) {
+            final File[] listFiles = new File(String.valueOf(outPath)).listFiles();
+            if (listFiles != null) {
+                for (File file : listFiles) {
+                    if (System.console() != null && file.getName().equals(schemaName)) {
+                        String userInput = System.console().readLine("There is already a file named '" + file.getName() +
+                                "' in the target location. Do you want to overwrite the file? [y/N] ");
+                        if (!Objects.equals(userInput.toLowerCase(Locale.ENGLISH), "y")) {
+                            throw new SchemaFileGenerationException(DiagnosticMessages.SDL_SCHEMA_104, null, 
+                                    "Schema generation aborted. File '" + file.getName() + "' was not overwritten.");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
      * This method use for checking the duplicate files.
      *
      * @param outPath     output path for file generated
